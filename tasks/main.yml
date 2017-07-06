@@ -4,8 +4,8 @@
   become: yes
 
   vars_files:
-    - defaults.yml
-    - vars.yml
+    - ../defaults/defaults.yml
+    - ../vars/vars.yml
 
   pre_tasks:
     - include_vars: "{{ item }}"
