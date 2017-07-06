@@ -22,6 +22,7 @@ git submodule update
 
 ```
 
+
 ## Testing
 
 This playbook ships with a Vagrant file for testing purpouse. If you
