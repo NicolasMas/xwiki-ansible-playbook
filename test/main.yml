@@ -16,6 +16,255 @@
   hosts: docker_containers
   roles:
     - role: xwiki
-  tasks:
-    - name: Test
-      command: 'echo "hello world"'
+      remote_user: root
+      become: yes
+
+      vars_files:
+        - defaults.yml
+        - vars.yml
+
+      pre_tasks:
+        - include_vars: "{{ item }}"
+          with_first_found:
+            - "host_vars/{{ inventory_hostname }}"
+            - "host_vars/default"
+          tags: [letsencrypt, postfix, firewall, monitoring, upgrade]
+
+        - name: Ensure "apache" user exists
+          yum: name=httpd state=present
+          when: xwiki_apache_service
+
+        - name: Ensure "postfix" user exists
+          yum: name=postfix state=present
+          when: xwiki_postfix_service
+
+        - name: Set SSL certs path
+          set_fact:
+            xwiki_certificate_file: "/etc/letsencrypt/live/{{servername}}/cert.pem"
+            xwiki_certificate_key_file: "/etc/letsencrypt/live/{{servername}}/privkey.pem"
+            xwiki_certificate_chain_file: "/etc/letsencrypt/live/{{servername}}/chain.pem"
+          when: not xwiki_debug
+          tags: postfix
+
+        - name: Set SSL certs path
+          set_fact:
+            xwiki_certificate_file: "/etc/ssl/{{servername}}/{{servername}}.pem"
+            xwiki_certificate_key_file: "/etc/ssl/{{servername}}/{{servername}}.key"
+            xwiki_certificate_chain_file: "/etc/ssl/{{servername}}/{{servername}}.csr"
+          when: xwiki_debug
+          tags: postfix
+
+      roles:
+        # Database installation and configuration
+        - role: ANXS.postgresql
+          postgresql_version: "{{xwiki_postgresql_version}}"
+          postgresql_encoding: "{{xwiki_postgresql_encoding}}"
+
+          postgresql_databases:
+            - name: "{{xwiki_database}}"
+              owner: "{{xwiki_database_user}}"
+
+          postgresql_users:
+            - name: "{{xwiki_database_user}}"
+              pass: "{{xwiki_database_user_pass}}"
+
+          postgresql_user_privileges:
+            - name: "{{xwiki_database_user}}"
+              db: "{{xwiki_database}}"
+
+        - role: silpion.java
+          oracle_java_distribution: srv
+          oracle_java_version: "{{ xwiki_java_version }}"
+
+        - role: rastandy.libreoffice-server
+          libreoffice_user: "{{ xwiki_user }}"
+          libreoffice_group: "{{ xwiki_group }}"
+          when: xwiki_libreoffice_service
+
+        - role: groover.tomcat
+          tomcat_version: "{{ xwiki_tomcat_version }}"
+          tomcat_instances:
+          - name: xwiki
+            user: "{{ xwiki_user }}"
+            group: "{{ xwiki_group }}"
+            path: "{{ xwiki_tomcat_path }}"
+            home: /home/{{ xwiki_user }}
+            service_name: tomcat-xwiki
+            service_file: tomcat-xwiki.service
+            catalina_opts: "{{ xwiki_catalina_opts}}"
+            port_ajp: 18009
+            port_connector: 18080
+            port_redirect: 18443
+            port_shutdown: 18005
+
+        # SSL certificate for the web server
+        - role: rastandy.letsencrypt
+          letsencrypt_email: "{{ administrator_email }}"
+          letsencrypt_cert_domains:
+            - "{{ servername }}"
+          when: (xwiki_apache_service or xwiki_postfix_service) and not xwiki_debug
+          tags: letsencrypt
+
+        - role: jdauphant.ssl-certs
+          ssl_certs_common_name: "{{ servername }}"
+          ssl_certs_path_owner: "apache"
+          ssl_certs_path_group: "apache"
+          ssl_certs_country: "EU"
+          ssl_certs_locality: "Europe"
+          ssl_certs_organization: "My Organization"
+          ssl_certs_state: "Europe"
+          ssl_certs_days: "1825"
+          when: (xwiki_apache_service or xwiki_postfix_service) and xwiki_debug
+
+        - role: rastandy.apache
+          apache_global_vhost_settings: |
+            SSLProxyEngine on
+          apache_vhosts:
+            - servername: "{{ servername }}"
+              documentroot: "/var/www/html"
+              extra_parameters: |
+                Redirect / https://{{ servername }}/
+          apache_vhosts_ssl:
+            - servername: "{{ servername }}"
+              documentroot: "/var/www/html"
+              certificate_file: "{{ xwiki_certificate_file }}"
+              certificate_key_file: "{{ xwiki_certificate_key_file }}"
+              certificate_chain_file: "{{ xwiki_certificate_chain_file }}"
+              extra_parameters: |
+                AllowEncodedSlashes On
+                TimeOut 300
+                ProxyRequests   Off
+                ProxyPreserveHost On
+                ProxyPass / ajp://localhost:18009/ nocanon
+                ProxyPassReverse / ajp://localhost:18009/ nocanon
+          when: xwiki_apache_service
+
+        - role: rastandy.postfix
+          postfix_mydestination: "localhost.localdomain, localhost, {{ ansible_hostname }}, {{ servername }}"
+          postfix_inet_interfaces: "127.0.0.1"
+          postfix_inet_protocols: "ipv4"
+          postfix_tls_cert_file: "{{ xwiki_certificate_file }}"
+          postfix_tls_key_file: "{{ xwiki_certificate_key_file }}"
+          when: xwiki_postfix_service
+          tags: postfix
+
+        - role: geerlingguy.firewall
+          firewall_allowed_tcp_ports:
+            - "22"   # ssh
+            - "80"   # http
+            - "443"  # https
+            - "9101" # bacula
+            - "9102" # bacula
+            - "9103" # bacula
+          firewall_allowed_udp_ports:
+            # - "60000" # mosh
+            # - "60001" # mosh
+          when: xwiki_firewall_service and not xwiki_debug
+          tags: firewall
+
+        # Setup the database backup
+        - role: Stouts.backup
+          backup_enabled: yes
+          backup_profiles:
+            - name: xwiki_postgresql
+              action: backup
+              schedule: 0 4 * * *
+              max_age: 1M
+              full_max_age: 1M
+              max_full_backups: 60
+              user: "{{ postgresql_admin_user }}"
+              postgres_host: ""
+              source: postgresql://{{xwiki_database}}
+              target: file:///var/lib/pgsql/{{ xwiki_postgresql_version }}/backups
+            - name: xwiki
+              action: backup
+              schedule: 0 4 * * *
+              max_age: 1W
+              full_max_age: 1W
+              max_full_backups: 1
+              user: "{{ xwiki_user }}"
+              source: "{{ xwiki_environment_permanent_directory }}"
+              target: file://{{ xwiki_tomcat_path }}/backups
+          when: xwiki_backup_service
+
+        # Activate bacula-fd client service
+        - role: rastandy.bacula-client
+          when: xwiki_bacula_service
+
+        - role: bennojoy.ntp
+
+        - role: rastandy.riemann-server
+          riemann_bind_address: 127.0.0.1
+          riemann_extra: true
+          when: xwiki_monitoring_service
+          tags: monitoring
+
+        - role: rastandy.riemann-client
+          riemann_tool_health: false
+          when: xwiki_monitoring_service
+          tags: monitoring
+
+        - role: rastandy.collectd
+          collectd_global_options_default_interval: 5
+          collectd_pkg_plugins:
+            - collectd-write_riemann
+            - collectd-postgresql
+          collectd_plugins_custom:
+            # Load df plugin
+            - options:
+              - LoadPlugin: write_riemann
+            # Include the /etc/collect.d directory
+            - sections:
+              - name: Include
+                param: "/etc/collectd.d"
+                content:
+                  - options:
+                    - Filter: "*.conf"
+              - name: Plugin
+                param: write_riemann
+                content:
+                  - options:
+                    - Tag: "collectd"
+                  - sections:
+                    - name: Node
+                      param: "center"
+                      content:
+                        # Options of the plugin
+                        - options:
+                          - Host: 127.0.0.1
+                          - Port: 5555
+                          - Protocol: TCP
+                          - StoreRates: true
+                          - AlwaysAppendDS: false
+                    - name: Node
+                      param: "center-unrated"
+                      content:
+                        - options:
+                          # Options of the plugin
+                          - Host: 127.0.0.1
+                          - Port: 5555
+                          - Protocol: TCP
+                          - StoreRates: false
+                          - AlwaysAppendDS: false
+          when: xwiki_monitoring_service
+          tags: monitoring
+
+      tasks:
+        - include: ./remove-xwiki.yml
+          tags: upgrade
+          when: upgrade
+
+        - include: ./install.yml
+          tags: upgrade
+
+        - include: ./configure.yml
+          tags: upgrade
+
+      handlers:
+        - name: Restart tomcat-xwiki
+          service:
+            name: tomcat-xwiki
+            state: restarted
+
+        - name: New mail aliases
+          command: /usr/bin/newaliases
